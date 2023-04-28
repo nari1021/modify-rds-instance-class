@@ -1,0 +1,410 @@
+description: |-
+  # ModifyRDSInstanceClass
+  ---
+  ```
+  ※ RDS Cluster의 Id와 Target Instance Class를 입력하여 DB Instance Class를 변경 시키는 절차를 정의함.
+  ```
+
+  ## 필수 입력 값
+  문서 동작을 위해 필요한 필수 입력 값
+
+  - **WebhookUrl** : Teams로 메시지를 보내기 위한 Teams Webhook URL
+  - **DBClusterId** : 변경하려는 인스턴스가 속해있는 RDS Cluster Id
+  - **InstanceClass** : 변경하려는 인스턴스 클래스
+
+
+  ## 동작 방법
+  아래의 절차를 차례로 수행 후 완료 메세지를 MS Teams 채널로 전달함.
+
+  1. **DescribeRDSCluster** : 입력 받은 DBClusterId 와 일치하는 RDS Cluster의 정보를 검색
+  2. **StartSendMessage** :  동작 시작 시 MS Teams로 알림 메시지를 보내고, 변경 시킬 Target DB instance Id를 반환
+  3. **ModifyDBInstance** : Target DB instance Id와 일치하는 instance들의 class를 미리 입력 받은 InstanceClass로 변경
+  4. **WaitUntilInstanceStateModifying** : Target DB Instance의 Status가 _**`Modifying`**_이 될 때까지 기다림
+  5. **WaitUntilInstanceStateAvailable** : Target DB Instance의 Status가 _**`Available`**_ 이 될 때까지 기다림
+  6. **FinishSendMessage** : 모든 동작이 완료 된 후 알림 메세지 전송
+  7. **SendFailMessage** : 단계별 절차 수행 중 오류가 발생 했을 경우 알림 메세지 전송
+  8. **SendCancelMessage** : 단계별 절차 수행 중 취소했을 경우 알림 메세지 전송
+schemaVersion: "0.3"
+assumeRole: ${iam_role}
+outputs:
+  - ModifyDBInstance.ModifyResult
+  - DescribeRDSCluster.DBClusters
+parameters:
+  WebhookUrl:
+    type: String
+    description: Teams Webhook URL
+  DBClusterId:
+    type: String
+    description: 변경하려는 인스턴스가 속해있는 RDS Cluster Id
+  InstanceClass:
+    type: String
+    description: 변경하려는 인스턴스 클래스
+mainSteps:
+  - name: DescribeRDSCluster
+    action: "aws:executeAwsApi"
+    outputs:
+      - Name: DBClusters
+        Selector: $.DBClusters
+        Type: MapList
+      - Name: DBClusterIdentifier
+        Selector: "$.DBClusters[0].DBClusterIdentifier"
+        Type: String
+    inputs:
+      Service: rds
+      Api: DescribeDBClusters
+      DBClusterIdentifier: "{{ DBClusterId }}"
+    nextStep: StartSendMessage
+    onFailure: "step:SendFailMessage"
+    onCancel: "step:SendCancelMessage"
+  - name: StartSendMessage
+    action: "aws:executeScript"
+    inputs:
+      Runtime: python3.8
+      Handler: script_handler
+      Script: |-
+        import json
+        import boto3
+        import urllib3
+        from botocore import client
+        from datetime import datetime, timedelta
+
+        class TeamsWebhookException(Exception):
+          """custom exception for failed webhook call"""
+          pass
+
+        class ConnectorCard:
+          def __init__(self, hook_url: str, title: str, target_instances: list, target_instance_classes: list, http_timeout=60):
+            self.http = urllib3.PoolManager()
+            self.now = datetime.utcnow() + timedelta(hours=9)
+            self.payload = {
+                "summary": "SSM Automation Notification",
+                "themeColor": "FF9900",
+                "title": title,
+                "sections": [{
+                    "facts": [{"name": "Target Instances:", "value": f"{target_instances}"},
+                              {"name": "Target Instances class:", "value" : f"{target_instance_classes}"},
+                              {"name": "Completed time:", "value": f"{self.now.strftime('%Y-%m-%d %H:%M:%S')}"}]
+                }]
+            }
+            self.hook_url = hook_url
+            self.http_timeout = http_timeout
+
+          def send(self):
+              headers = {"Content-Type": "application/json"}
+              r = self.http.request(
+                  'POST',
+                  f'{self.hook_url}',
+                  body=json.dumps(self.payload).encode('utf-8'),
+                  headers=headers, timeout=self.http_timeout)
+              if r.status == 200:
+                  return True
+              else:
+                  raise TeamsWebhookException(r.reason)
+
+        def script_handler(events, context):
+          msteams_webhook= events['WEBHOOK']
+          db_cluster_identifier = events['DBClusterIdentifier']
+
+          client = boto3.client('rds')
+
+          target_instances = get_db_cluster_members(client, db_cluster_identifier)
+          target_instance_classes = get_instance_classes(client, target_instances)
+
+          payload = {
+            'title': 'Start ModifyDBInstance',
+            'target_instances': target_instances,
+            'target_instance_classes': target_instance_classes,
+          }
+
+          teams_message = ConnectorCard(hook_url=msteams_webhook, title=payload.get("title"), target_instances=payload.get("target_instances"), target_instance_classes=payload.get("target_instance_classes"))
+          result = teams_message.send()
+
+          return target_instances
+
+        def get_db_cluster_members(client: client, db_cluster_identifier: str) -> list:
+            target_db_cluster = client.describe_db_clusters(
+              DBClusterIdentifier = db_cluster_identifier
+            )
+            return [i.get('DBInstanceIdentifier') for i in target_db_cluster.get("DBClusters")[0].get("DBClusterMembers")]
+
+        def get_instance_classes(client: client, instances: list) -> list:
+          return [client.describe_db_instances(DBInstanceIdentifier = x).get("DBInstances")[0].get("DBInstanceClass") for x in instances]
+      InputPayload:
+        DBClusterIdentifier: "{{ DescribeRDSCluster.DBClusterIdentifier }}"
+        WEBHOOK: "{{ WebhookUrl }}"
+    outputs:
+      - Name: target_instances
+        Selector: $.Payload
+        Type: StringList
+    nextStep: ModifyDBInstance
+    onFailure: "step:SendFailMessage"
+    onCancel: "step:SendCancelMessage"
+  - name: ModifyDBInstance
+    action: "aws:executeScript"
+    inputs:
+      Runtime: python3.8
+      Handler: script_handler
+      Script: |-
+        import boto3
+        ALLOWED_INSTANCE_CLASS = ('db.r5.2xlarge', 'db.r5.12xlarge')
+
+        def script_handler(events, context):
+          db_instance_class = events.get('DBInstanceClass')
+          instances = events.get('DBInstances')
+          db_cluster_identifier = events.get('DBClusterIdentifier')
+          assert db_instance_class in ALLOWED_INSTANCE_CLASS, "Please Check InstanceClass Input ..."
+          client = boto3.client('rds')
+          result = list()
+
+          for i in instances:
+            resp = client.modify_db_instance(
+              DBInstanceIdentifier = i,
+              DBInstanceClass = db_instance_class,
+              ApplyImmediately = True
+            )
+            result.append(resp['DBInstance']['DBInstanceIdentifier'])
+          return result
+      InputPayload:
+        DBInstances: "{{ StartSendMessage.target_instances }}"
+        DBClusterIdentifier: "{{ DescribeRDSCluster.DBClusterIdentifier }}"
+        DBInstanceClass: "{{ InstanceClass }}"
+    outputs:
+      - Name: ModifyResult
+        Selector: $.Payload
+        Type: StringList
+    nextStep: WaitUntilInstanceStateModifying
+    onFailure: "step:SendFailMessage"
+    onCancel: "step:SendCancelMessage"
+  - name: WaitUntilInstanceStateModifying
+    action: "aws:waitForAwsResourceProperty"
+    inputs:
+      Service: rds
+      Api: DescribeDBInstances
+      PropertySelector: $.DBInstances..DBInstanceStatus
+      DesiredValues:
+        - modifying
+      Filters:
+        - Name: db-cluster-id
+          Values:
+            - "{{ DBClusterId }}"
+    nextStep: WaitUntilInstanceStateAvailable
+    onFailure: "step:SendFailMessage"
+    onCancel: "step:SendCancelMessage"
+  - name: WaitUntilInstanceStateAvailable
+    action: "aws:waitForAwsResourceProperty"
+    inputs:
+      Api: DescribeDBInstances
+      DesiredValues:
+        - available
+      PropertySelector: $.DBInstances..DBInstanceStatus
+      Service: rds
+      Filters:
+        - Name: db-cluster-id
+          Values:
+            - "{{ DBClusterId }}"
+    nextStep: FinishSendMessage
+    onFailure: "step:SendFailMessage"
+    onCancel: "step:SendCancelMessage"
+  - name: FinishSendMessage
+    action: "aws:executeScript"
+    inputs:
+      Runtime: python3.8
+      Handler: script_handler
+      Script: |-
+        import json
+        import boto3
+        import urllib3
+        from botocore import client
+        from datetime import datetime, timedelta
+
+        class TeamsWebhookException(Exception):
+          """custom exception for failed webhook call"""
+          pass
+
+        class ConnectorCard:
+          def __init__(self, hook_url: str, title: str, target_instances: list, target_instance_classes: list, http_timeout=60):
+            self.http = urllib3.PoolManager()
+            self.now = datetime.utcnow() + timedelta(hours=9)
+            self.payload = {
+                "summary": "SSM Automation Notification",
+                "themeColor": "FF9900",
+                "title": title,
+                "sections": [{
+                    "facts": [{"name": "Target Instances:", "value": f"{target_instances}"},
+                              {"name": "Target Instances class:", "value" : f"{target_instance_classes}"},
+                              {"name": "Completed time:", "value": f"{self.now.strftime('%Y-%m-%d %H:%M:%S')}"}]
+                }]
+            }
+            self.hook_url = hook_url
+            self.http_timeout = http_timeout
+
+          def send(self):
+            headers = {"Content-Type": "application/json"}
+            r = self.http.request(
+                'POST',
+                f'{self.hook_url}',
+                body=json.dumps(self.payload).encode('utf-8'),
+                headers=headers, timeout=self.http_timeout)
+            if r.status == 200:
+                return True
+            else:
+                raise TeamsWebhookException(r.reason)
+
+        def script_handler(events, context):
+          client = boto3.client('rds')
+          msteams_webhook= events.get('WEBHOOK')
+          db_cluster_identifier = events.get('DBClusterIdentifier')
+
+          target_cluster_members = get_db_cluster_members(client, db_cluster_identifier)
+          target_instance_classes = get_instance_classes(client, target_cluster_members)
+
+          payload = {
+            'title': 'Finish ModifyDBInstance',
+            'target_instances': target_cluster_members,
+            'target_instance_classes': target_instance_classes,
+          }
+
+          teams_message = ConnectorCard(hook_url=msteams_webhook, title=payload.get("title"), target_instances=payload.get("target_instances"), target_instance_classes=payload.get("target_instance_classes"))
+          result = teams_message.send()
+
+          return {"target_instances" : target_cluster_members, "target_instance_classes": target_instance_classes}
+
+        def get_db_cluster_members(client: client, db_cluster_identifier: str) -> list:
+            target_db_cluster = client.describe_db_clusters(
+              DBClusterIdentifier = db_cluster_identifier
+            )
+            return [i.get('DBInstanceIdentifier') for i in target_db_cluster.get("DBClusters")[0].get("DBClusterMembers")]
+
+        def get_instance_classes(client: client, instances: list) -> list:
+          return [client.describe_db_instances(DBInstanceIdentifier = x).get("DBInstances")[0].get("DBInstanceClass") for x in instances]
+      InputPayload:
+        DBClusterIdentifier: "{{ DescribeRDSCluster.DBClusterIdentifier }}"
+        WEBHOOK: "{{ WebhookUrl }}"
+    outputs:
+      - Name: result
+        Selector: $.Payload
+        Type: StringMap
+    onFailure: "step:SendFailMessage"
+    onCancel: "step:SendCancelMessage"
+    isEnd: true
+    isCritical: false
+  - name: SendFailMessage
+    action: "aws:executeScript"
+    inputs:
+      Runtime: python3.8
+      Handler: script_handler
+      Script: |-
+        import json
+        import boto3
+        import urllib3
+        from botocore import client
+        from datetime import datetime, timedelta
+
+        class TeamsWebhookException(Exception):
+          """custom exception for failed webhook call"""
+          pass
+
+        class ConnectorCard:
+          def __init__(self, hook_url: str, title: str, msg: str, http_timeout=60):
+            self.http = urllib3.PoolManager()
+            self.now = datetime.utcnow() + timedelta(hours=9)
+            self.payload = {
+                "summary": "SSM Automation Notification",
+                "themeColor": "FF9900",
+                "title": title,
+                "sections": [{
+                    "facts": [{"name": "Message:", "value": f"{msg}"},
+                              {"name": "Completed time:", "value": f"{self.now.strftime('%Y-%m-%d %H:%M:%S')}"}]
+                }]
+            }
+            self.hook_url = hook_url
+            self.http_timeout = http_timeout
+
+          def send(self):
+            headers = {"Content-Type": "application/json"}
+            r = self.http.request(
+                'POST',
+                f'{self.hook_url}',
+                body=json.dumps(self.payload).encode('utf-8'),
+                headers=headers, timeout=self.http_timeout)
+            if r.status == 200:
+                return True
+            else:
+                raise TeamsWebhookException(r.reason)
+
+        def script_handler(events, context):
+          msteams_webhook= events.get('WEBHOOK')
+
+          payload = {
+            'title': 'Fail ModifyDBInstance',
+            'msg': 'Please check AWS Automation execution logs.',
+          }
+
+          teams_message = ConnectorCard(hook_url=msteams_webhook, title=payload.get("title"), msg=payload.get("msg"))
+          result = teams_message.send()
+          payload['send_msg'] = result
+          return payload
+      InputPayload:
+        WEBHOOK: "{{ WebhookUrl }}"
+    isCritical: false
+    isEnd: true
+  - name: SendCancelMessage
+    action: "aws:executeScript"
+    inputs:
+      Runtime: python3.8
+      Handler: script_handler
+      Script: |-
+        import json
+        import boto3
+        import urllib3
+        from botocore import client
+        from datetime import datetime, timedelta
+
+        class TeamsWebhookException(Exception):
+          """custom exception for failed webhook call"""
+          pass
+
+        class ConnectorCard:
+          def __init__(self, hook_url: str, title: str, msg: str, http_timeout=60):
+            self.http = urllib3.PoolManager()
+            self.now = datetime.utcnow() + timedelta(hours=9)
+            self.payload = {
+                "summary": "SSM Automation Notification",
+                "themeColor": "FF9900",
+                "title": title,
+                "sections": [{
+                    "facts": [{"name": "Message:", "value": f"{msg}"},
+                              {"name": "Completed time:", "value": f"{self.now.strftime('%Y-%m-%d %H:%M:%S')}"}]
+                }]
+            }
+            self.hook_url = hook_url
+            self.http_timeout = http_timeout
+
+          def send(self):
+            headers = {"Content-Type": "application/json"}
+            r = self.http.request(
+                'POST',
+                f'{self.hook_url}',
+                body=json.dumps(self.payload).encode('utf-8'),
+                headers=headers, timeout=self.http_timeout)
+            if r.status == 200:
+                return True
+            else:
+                raise TeamsWebhookException(r.reason)
+
+        def script_handler(events, context):
+          msteams_webhook= events.get('WEBHOOK')
+
+          payload = {
+            'title': 'Cancel ModifyDBInstance',
+            'msg': 'Please check AWS Automation execution logs.',
+          }
+
+          teams_message = ConnectorCard(hook_url=msteams_webhook, title=payload.get("title"), msg=payload.get("msg"))
+          result = teams_message.send()
+          payload['send_msg'] = result
+          return payload
+      InputPayload:
+        WEBHOOK: "{{ WebhookUrl }}"
+    isCritical: false
+    isEnd: true
